@@ -2,6 +2,13 @@ import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 
+const strategySelectorSchema = {
+  entity_id: z.string().optional().describe('Strategy entity ID from chart state/list. Use when multiple strategies are on the chart.'),
+  strategy_name: z.string().optional().describe('Strategy name substring. Use when multiple strategies are on the chart.'),
+  latest: z.coerce.boolean().optional().describe('Use the latest strategy source on the chart.'),
+  active: z.coerce.boolean().optional().describe('Use the active Strategy Tester strategy.'),
+};
+
 export function registerDataTools(server) {
   server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
@@ -18,20 +25,35 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester', {}, async () => {
-    try { return jsonResult(await core.getStrategyResults()); }
+  server.tool('data_list_strategies', 'List strategy studies on the chart with entity IDs and report readiness', {}, async () => {
+    try { return jsonResult(await core.listStrategies()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester', strategySelectorSchema, async (args) => {
+    try { return jsonResult(await core.getStrategyResults(args)); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
   server.tool('data_get_trades', 'Get trade list from Strategy Tester', {
+    ...strategySelectorSchema,
     max_trades: z.coerce.number().optional().describe('Maximum trades to return'),
-  }, async ({ max_trades }) => {
-    try { return jsonResult(await core.getTrades({ max_trades })); }
+  }, async (args) => {
+    try { return jsonResult(await core.getTrades(args)); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_equity', 'Get equity curve data from Strategy Tester', {}, async () => {
-    try { return jsonResult(await core.getEquity()); }
+  server.tool('data_get_equity', 'Get equity curve data from Strategy Tester', strategySelectorSchema, async (args) => {
+    try { return jsonResult(await core.getEquity(args)); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('data_export_trades_csv', 'Download the active Strategy Tester List of trades CSV and return file metadata', {
+    ...strategySelectorSchema,
+    downloads_dir: z.string().optional().describe('Downloads directory to watch. Defaults to the OS Downloads folder.'),
+    timeout_ms: z.coerce.number().optional().describe('Download timeout in milliseconds.'),
+  }, async (args) => {
+    try { return jsonResult(await core.exportTrades(args)); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

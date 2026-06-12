@@ -4,6 +4,7 @@
  * They throw on error (callers catch and format).
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
+import { waitUntil } from '../wait.js';
 
 // ── Monaco finder (injected into TV page) ──
 const FIND_MONACO = `
@@ -281,42 +282,179 @@ export async function setSource({ source }) {
   return { success: true, lines_set: source.split('\n').length };
 }
 
-export async function compile() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
-
-  const clicked = await evaluate(`
+async function getStudySnapshot() {
+  return evaluate(`
     (function() {
-      var btns = document.querySelectorAll('button');
-      var fallback = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
+      try {
+        var chart = window.TradingViewApi._activeChartWidgetWV.value();
+        var studies = [];
+        if (chart && typeof chart.getAllStudies === 'function') {
+          studies = chart.getAllStudies().map(function(s) {
+            return { id: s.id, name: s.name || s.title || 'unknown' };
+          });
         }
-        if (!fallback && /^(Add to chart|Update on chart)/i.test(text)) {
-          fallback = btns[i];
-        }
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) {
-          saveBtn = btns[i];
-        }
+        return {
+          symbol: chart && chart.symbol ? chart.symbol() : null,
+          resolution: chart && chart.resolution ? chart.resolution() : null,
+          studies: studies
+        };
+      } catch(e) {
+        return { studies: [], error: e.message };
       }
-      if (fallback) { fallback.click(); return fallback.textContent.trim(); }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
     })()
   `);
+}
 
-  if (!clicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
+async function getPineMarkers() {
+  return evaluate(`
+    (function() {
+      var m = ${FIND_MONACO};
+      if (!m) return [];
+      var model = m.editor.getModel();
+      if (!model) return [];
+      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
+      return markers.map(function(mk) {
+        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
+      });
+    })()
+  `);
+}
 
-  await new Promise(r => setTimeout(r, 2000));
-  return { success: true, button_clicked: clicked || 'keyboard_shortcut', source: 'dom_fallback' };
+async function getCurrentSourceText() {
+  return evaluate(`
+    (function() {
+      var m = ${FIND_MONACO};
+      if (!m) return '';
+      return m.editor.getValue() || '';
+    })()
+  `);
+}
+
+async function getStrategyStatus(entityId) {
+  return evaluate(`
+    (function() {
+      var wanted = ${JSON.stringify(entityId)};
+      try {
+        var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+        var sources = chart.model().model().dataSources();
+        for (var i = 0; i < sources.length; i++) {
+          var s = sources[i];
+          var id = null;
+          try { id = s.id && s.id(); } catch(e) {}
+          if (id !== wanted) continue;
+          var meta = {};
+          try { meta = s.metaInfo && s.metaInfo() || {}; } catch(e) {}
+          var rd = null;
+          try { rd = s.reportData ? (typeof s.reportData === 'function' ? s.reportData() : s.reportData) : s._reportData; } catch(e) {}
+          try { if (rd && typeof rd.value === 'function') rd = rd.value(); } catch(e) {}
+          var perf = rd && rd.performance || {};
+          var all = perf.all || {};
+          return {
+            id: id,
+            name: (s.name && s.name()) || meta.description || meta.shortDescription || 'unknown',
+            is_strategy: !!(meta.isTVScriptStrategy || /StrategyScript/.test(meta.id || '') || rd || s.reportData || s.ordersData),
+            report_ready: !!rd,
+            trades_count: rd && Array.isArray(rd.trades) ? rd.trades.length : null,
+            filled_orders_count: rd && Array.isArray(rd.filledOrders) ? rd.filledOrders.length : null,
+            net_profit: all.netProfit,
+            profit_factor: all.profitFactor
+          };
+        }
+        return null;
+      } catch(e) {
+        return { error: e.message };
+      }
+    })()
+  `);
+}
+
+async function clickPineAddButton() {
+  return evaluate(`
+    (function() {
+      function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+      function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
+      function candidateInfo(item) {
+        return { text: item.text, title: item.title, aria: item.aria, index: item.index };
+      }
+      var buttons = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]'));
+      var candidates = buttons.map(function(b, i) {
+        return {
+          index: i,
+          el: b,
+          text: norm(b.textContent),
+          title: norm(b.getAttribute('title')),
+          aria: norm(b.getAttribute('aria-label')),
+          visible: visible(b),
+          disabled: !!b.disabled,
+          className: String(b.className || '')
+        };
+      }).filter(function(x) { return x.visible && !x.disabled; });
+
+      var saveAdd = candidates.find(function(x) {
+        return /save and add to chart/i.test(x.text + ' ' + x.title + ' ' + x.aria);
+      });
+      if (saveAdd) {
+        saveAdd.el.click();
+        return { clicked: true, button: 'Save and add to chart', candidate: candidateInfo(saveAdd), confirmation: true };
+      }
+
+      var update = candidates.find(function(x) {
+        return /update on chart/i.test(x.text + ' ' + x.title + ' ' + x.aria);
+      });
+      if (update) {
+        update.el.click();
+        return { clicked: true, button: 'Update on chart', candidate: candidateInfo(update), update: true };
+      }
+
+      var add = candidates.find(function(x) {
+        return /add to chart/i.test(x.text + ' ' + x.title + ' ' + x.aria);
+      });
+      if (add) {
+        add.el.click();
+        return { clicked: true, button: 'Add to chart', candidate: candidateInfo(add) };
+      }
+
+      return {
+        clicked: false,
+        candidates: candidates
+          .filter(function(x) { return /add|update|save/i.test(x.text + ' ' + x.title + ' ' + x.aria + ' ' + x.className); })
+          .slice(0, 20)
+          .map(candidateInfo)
+      };
+    })()
+  `);
+}
+
+async function clickSaveAndAddConfirmation() {
+  return evaluate(`
+    (function() {
+      function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+      function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
+      var buttons = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]'));
+      for (var i = 0; i < buttons.length; i++) {
+        var b = buttons[i];
+        if (!visible(b) || b.disabled) continue;
+        var text = norm(b.textContent);
+        var title = norm(b.getAttribute('title'));
+        if (/save and add to chart/i.test(text + ' ' + title)) {
+          b.click();
+          return { clicked: true, button: 'Save and add to chart', text: text, title: title };
+        }
+      }
+      var dialogs = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"], [class*="dialog"], [class*="modal"], [class*="popup"]'));
+      for (var d = 0; d < dialogs.length; d++) {
+        var text = norm(dialogs[d].textContent);
+        if (/Cannot add a script with unsaved changes|save them|Save and add to chart/i.test(text)) {
+          return { clicked: false, dialog_text: text.slice(0, 240) };
+        }
+      }
+      return { clicked: false, dialog_text: null };
+    })()
+  `);
+}
+
+export async function compile() {
+  return smartCompile();
 }
 
 export async function getErrors() {
@@ -430,78 +568,67 @@ export async function smartCompile() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const studiesBefore = await evaluate(`
-    (function() {
-      try {
-        var chart = window.TradingViewApi._activeChartWidgetWV.value();
-        if (chart && typeof chart.getAllStudies === 'function') return chart.getAllStudies().length;
-      } catch(e) {}
-      return null;
-    })()
-  `);
+  const sourceText = await getCurrentSourceText();
+  const isStrategyScript = /(^|\n)\s*strategy\s*\(/.test(sourceText);
+  const before = await getStudySnapshot();
+  const beforeIds = new Set((before?.studies || []).map(s => s.id));
+  let buttonClicked = await clickPineAddButton();
 
-  const buttonClicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var addBtn = null;
-      var updateBtn = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
-        if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
-      }
-      if (addBtn) { addBtn.click(); return 'Add to chart'; }
-      if (updateBtn) { updateBtn.click(); return 'Update on chart'; }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
-
-  if (!buttonClicked) {
+  if (!buttonClicked?.clicked) {
     const c = await getClient();
     await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
     await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
+    buttonClicked = { clicked: true, button: 'keyboard_shortcut' };
   }
 
-  await new Promise(r => setTimeout(r, 2500));
+  await new Promise(r => setTimeout(r, 500));
+  const confirmation = await clickSaveAndAddConfirmation();
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
-    })()
-  `);
+  const wait = await waitUntil(async () => {
+    const snapshot = await getStudySnapshot();
+    const newStudies = (snapshot?.studies || []).filter(s => !beforeIds.has(s.id));
+    if (newStudies.length > 0) return { snapshot, newStudies };
+    if (buttonClicked?.update) return { snapshot, newStudies: [] };
+    return null;
+  }, { timeout: 12000, interval: 500 });
 
-  const studiesAfter = await evaluate(`
-    (function() {
-      try {
-        var chart = window.TradingViewApi._activeChartWidgetWV.value();
-        if (chart && typeof chart.getAllStudies === 'function') return chart.getAllStudies().length;
-      } catch(e) {}
-      return null;
-    })()
-  `);
-
-  const studyAdded = (studiesBefore !== null && studiesAfter !== null) ? studiesAfter > studiesBefore : null;
+  const errors = await getPineMarkers();
+  const after = wait.value?.snapshot || await getStudySnapshot();
+  const newStudies = wait.value?.newStudies || [];
+  const studyAdded = newStudies.length > 0;
+  let strategyReport = null;
+  let reportWait = null;
+  if (isStrategyScript && newStudies[0]?.id) {
+    reportWait = await waitUntil(async () => {
+      const status = await getStrategyStatus(newStudies[0].id);
+      return status?.report_ready ? status : null;
+    }, { timeout: 20000, interval: 500 });
+    strategyReport = reportWait.value || await getStrategyStatus(newStudies[0].id);
+  }
+  const hasErrors = errors?.length > 0;
+  const success = !hasErrors && (studyAdded || buttonClicked?.update);
+  const warning = success
+    ? (isStrategyScript && studyAdded && !strategyReport?.report_ready ? 'Strategy was added but reportData was not ready before timeout.' : undefined)
+    : 'No new study was added after compile/add action.';
 
   return {
-    success: true,
-    button_clicked: buttonClicked || 'keyboard_shortcut',
-    has_errors: errors?.length > 0,
+    success,
+    button_clicked: buttonClicked?.button || 'unknown',
+    button: buttonClicked,
+    confirmation,
+    has_errors: hasErrors,
     errors: errors || [],
     study_added: studyAdded,
+    new_studies: newStudies,
+    strategy_report_ready: strategyReport?.report_ready,
+    strategy_report: strategyReport,
+    before_study_count: before?.studies?.length ?? null,
+    after_study_count: after?.studies?.length ?? null,
+    symbol: after?.symbol,
+    resolution: after?.resolution,
+    wait_ms: wait.elapsed_ms,
+    report_wait_ms: reportWait?.elapsed_ms,
+    warning,
   };
 }
 

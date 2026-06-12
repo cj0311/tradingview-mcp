@@ -34,29 +34,99 @@ export async function openPanel({ panel, action }) {
     const widgetName = panel === 'pine-editor' ? 'pine-editor' : 'backtesting';
     const result = await evaluate(`
       (function() {
+        function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+        function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
+        function stateFor(panel) {
+          var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
+          var bottomOpen = !!(bottomArea && bottomArea.offsetHeight > 50);
+          var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco');
+          if (panel === 'pine-editor') return visible(monacoEl);
+          var strategyPanel = document.querySelector('[data-name="backtesting"]')
+            || document.querySelector('[class*="strategyReport"]');
+          if (visible(strategyPanel)) return true;
+          var els = document.querySelectorAll('button, [role="button"], [role="tab"], span, div');
+          for (var i = 0; i < els.length; i++) {
+            if (!visible(els[i])) continue;
+            var text = norm(els[i].textContent);
+            var title = norm(els[i].getAttribute('title'));
+            if (/List of trades|Performance Summary|Overview/.test(text) || /Download \\.csv/i.test(title)) return true;
+          }
+          return bottomOpen && false;
+        }
+        function clickByTextOrTitle(patterns) {
+          var candidates = document.querySelectorAll('button, [role="button"], [role="tab"], a');
+          for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            if (!visible(el) || el.disabled) continue;
+            var hay = norm(el.textContent) + ' ' + norm(el.getAttribute('title')) + ' ' + norm(el.getAttribute('aria-label'));
+            for (var p = 0; p < patterns.length; p++) {
+              if (patterns[p].test(hay)) { el.click(); return hay.substring(0, 80); }
+            }
+          }
+          return null;
+        }
         var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
         if (!bwb) return { error: 'bottomWidgetBar not available' };
         var panel = ${JSON.stringify(panel)};
         var widgetName = ${JSON.stringify(widgetName)};
         var action = ${JSON.stringify(action)};
-        var bottomArea = document.querySelector('[class*="layout__area--bottom"]');
-        var isOpen = !!(bottomArea && bottomArea.offsetHeight > 50);
-        if (panel === 'pine-editor') { var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco'); isOpen = isOpen && !!monacoEl; }
-        if (panel === 'strategy-tester') { var stratPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]'); isOpen = isOpen && !!(stratPanel && stratPanel.offsetParent); }
+        var isOpen = stateFor(panel);
         var performed = 'none';
         if (action === 'open' || (action === 'toggle' && !isOpen)) {
-          if (panel === 'pine-editor') { if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab(); else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
-          else { if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName); }
+          if (panel === 'pine-editor') {
+            if (typeof bwb.activateScriptEditorTab === 'function') bwb.activateScriptEditorTab();
+            else if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName);
+            else if (typeof bwb.activateWidget === 'function') bwb.activateWidget(widgetName);
+            else if (typeof bwb.show === 'function') bwb.show();
+            clickByTextOrTitle([/^Pine$/i, /Pine Editor/i]);
+          } else {
+            if (typeof bwb.showWidget === 'function') bwb.showWidget(widgetName);
+            else if (typeof bwb.activateWidget === 'function') bwb.activateWidget(widgetName);
+            else if (typeof bwb.show === 'function') bwb.show();
+            clickByTextOrTitle([/Strategy Tester/i, /List of trades/i]);
+          }
           performed = 'opened';
         } else if (action === 'close' || (action === 'toggle' && isOpen)) {
           if (typeof bwb.hideWidget === 'function') bwb.hideWidget(widgetName);
+          else if (typeof bwb.close === 'function') bwb.close();
+          else if (typeof bwb.hide === 'function') bwb.hide();
+          clickByTextOrTitle([/Collapse panel/i, /^Close$/i]);
           performed = 'closed';
         }
         return { was_open: isOpen, performed: performed };
       })()
     `);
     if (result && result.error) throw new Error(result.error);
-    return { success: true, panel, action, was_open: result?.was_open ?? false, performed: result?.performed ?? 'unknown' };
+    await new Promise(r => setTimeout(r, 700));
+    const actualOpen = await evaluate(`
+      (function() {
+        function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+        function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
+        var panel = ${JSON.stringify(panel)};
+        if (panel === 'pine-editor') return visible(document.querySelector('.monaco-editor.pine-editor-monaco'));
+        var strategyPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]');
+        if (visible(strategyPanel)) return true;
+        var els = document.querySelectorAll('button, [role="button"], [role="tab"], span, div');
+        for (var i = 0; i < els.length; i++) {
+          if (!visible(els[i])) continue;
+          var text = norm(els[i].textContent);
+          var title = norm(els[i].getAttribute('title'));
+          if (/List of trades|Performance Summary|Overview/.test(text) || /Download \\.csv/i.test(title)) return true;
+        }
+        return false;
+      })()
+    `);
+    const wantedOpen = action === 'open' || (action === 'toggle' && !(result?.was_open));
+    const success = action === 'toggle' ? true : actualOpen === wantedOpen;
+    return {
+      success,
+      panel,
+      action,
+      was_open: result?.was_open ?? false,
+      performed: result?.performed ?? 'unknown',
+      actual_open: !!actualOpen,
+      warning: success ? undefined : `Panel state did not become ${wantedOpen ? 'open' : 'closed'}`,
+    };
   } else {
     const selectorMap = {
       'watchlist': { dataName: 'base-watchlist-widget-button', ariaLabel: 'Watchlist' },

@@ -47,8 +47,22 @@ export async function captureScreenshot({ region, filename, method } = {}) {
   } else if (region === 'strategy_tester') {
     const bounds = await evaluate(`
       (function() {
+        function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+        function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
         var el = document.querySelector('[data-name="backtesting"]')
           || document.querySelector('[class*="strategyReport"]');
+        if (!visible(el)) {
+          var candidates = document.querySelectorAll('button, [role="button"], [role="tab"], span, div');
+          for (var i = 0; i < candidates.length; i++) {
+            if (!visible(candidates[i])) continue;
+            var text = norm(candidates[i].textContent);
+            var title = norm(candidates[i].getAttribute('title'));
+            if (/List of trades|Performance Summary|Overview/.test(text) || /Download \\.csv/i.test(title)) {
+              el = candidates[i].closest('[class*="bottom"], [class*="panel"], [class*="widget"], [data-name="backtesting"]') || candidates[i].parentElement;
+              break;
+            }
+          }
+        }
         if (!el) return null;
         var rect = el.getBoundingClientRect();
         return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };

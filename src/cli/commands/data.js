@@ -1,6 +1,22 @@
 import { register } from '../router.js';
 import * as core from '../../core/data.js';
 
+const strategySelectorOptions = {
+  'entity-id': { type: 'string', description: 'Strategy entity ID from state/list-strategies' },
+  name: { type: 'string', description: 'Strategy name substring' },
+  latest: { type: 'boolean', description: 'Use the latest strategy source on chart' },
+  active: { type: 'boolean', description: 'Use the active Strategy Tester strategy' },
+};
+
+function strategySelector(opts) {
+  return {
+    entity_id: opts['entity-id'],
+    strategy_name: opts.name,
+    latest: opts.latest,
+    active: opts.active,
+  };
+}
+
 register('quote', {
   description: 'Get real-time price quote',
   handler: (opts, positionals) => core.getQuote({ symbol: positionals[0] }),
@@ -60,18 +76,38 @@ register('data', {
     }],
     ['strategy', {
       description: 'Get strategy performance metrics',
-      handler: () => core.getStrategyResults(),
+      options: strategySelectorOptions,
+      handler: (opts) => core.getStrategyResults(strategySelector(opts)),
+    }],
+    ['list-strategies', {
+      description: 'List strategy studies on the chart',
+      handler: () => core.listStrategies(),
     }],
     ['trades', {
       description: 'Get strategy trade list',
       options: {
+        ...strategySelectorOptions,
         max: { type: 'string', short: 'n', description: 'Max trades to return' },
       },
-      handler: (opts) => core.getTrades({ max_trades: opts.max ? Number(opts.max) : undefined }),
+      handler: (opts) => core.getTrades({ ...strategySelector(opts), max_trades: opts.max ? Number(opts.max) : undefined }),
     }],
     ['equity', {
       description: 'Get strategy equity curve',
-      handler: () => core.getEquity(),
+      options: strategySelectorOptions,
+      handler: (opts) => core.getEquity(strategySelector(opts)),
+    }],
+    ['export-trades', {
+      description: 'Download Strategy Tester trade list CSV',
+      options: {
+        ...strategySelectorOptions,
+        'downloads-dir': { type: 'string', description: 'Downloads directory to watch' },
+        timeout: { type: 'string', description: 'Download timeout in milliseconds' },
+      },
+      handler: (opts) => core.exportTrades({
+        ...strategySelector(opts),
+        downloads_dir: opts['downloads-dir'],
+        timeout_ms: opts.timeout ? Number(opts.timeout) : undefined,
+      }),
     }],
     ['depth', {
       description: 'Get order book / DOM data',

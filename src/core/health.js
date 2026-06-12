@@ -98,8 +98,20 @@ export async function uiState() {
       ui.right_panel = { open: !!(right && right.offsetWidth > 50), width: right ? right.offsetWidth : 0 };
       var monacoEl = document.querySelector('.monaco-editor.pine-editor-monaco');
       ui.pine_editor = { open: !!monacoEl, width: monacoEl ? monacoEl.offsetWidth : 0, height: monacoEl ? monacoEl.offsetHeight : 0 };
+      function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+      function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
       var stratPanel = document.querySelector('[data-name="backtesting"]') || document.querySelector('[class*="strategyReport"]');
-      ui.strategy_tester = { open: !!(stratPanel && stratPanel.offsetParent) };
+      var stratOpen = visible(stratPanel);
+      if (!stratOpen) {
+        var els = document.querySelectorAll('button, [role="button"], [role="tab"], span, div');
+        for (var si = 0; si < els.length; si++) {
+          if (!visible(els[si])) continue;
+          var st = norm(els[si].textContent);
+          var title = norm(els[si].getAttribute('title'));
+          if (/List of trades|Performance Summary|Overview/.test(st) || /Download \\.csv/i.test(title)) { stratOpen = true; break; }
+        }
+      }
+      ui.strategy_tester = { open: stratOpen };
       var widgetbar = document.querySelector('[data-name="widgetbar-wrap"]');
       ui.widgetbar = { open: !!(widgetbar && widgetbar.offsetWidth > 50) };
       ui.buttons = {};
@@ -137,9 +149,10 @@ export async function uiState() {
         var b = btns[i];
         if (b.offsetParent === null) continue;
         var text = b.textContent.trim();
+        var hay = text + ' ' + (b.getAttribute('title') || '') + ' ' + (b.getAttribute('aria-label') || '');
         for (var k in keyLabels) {
-          if (keyLabels[k].test(text)) {
-            ui.key_buttons[k] = { text: text.substring(0, 40), disabled: b.disabled, visible: b.offsetWidth > 0 };
+          if (keyLabels[k].test(hay)) {
+            ui.key_buttons[k] = { text: text.substring(0, 40), title: b.getAttribute('title') || null, aria_label: b.getAttribute('aria-label') || null, disabled: b.disabled, visible: b.offsetWidth > 0 };
           }
         }
       }

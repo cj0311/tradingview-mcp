@@ -2,11 +2,194 @@
  * Core data access logic.
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS } from '../connection.js';
+import { readdirSync, statSync, readFileSync } from 'fs';
+import { basename, join } from 'path';
+import { homedir } from 'os';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
 const CHART_API = KNOWN_PATHS.chartApi;
 const BARS_PATH = KNOWN_PATHS.mainSeriesBars;
+
+const STRATEGY_HELPERS = `
+  function norm(s) { return String(s || '').replace(/\\s+/g, ' ').trim(); }
+  function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+  function safeValue(v) {
+    try {
+      if (v && typeof v.value === 'function') return v.value();
+    } catch(e) {}
+    return v;
+  }
+  function sourceId(s) {
+    try { return s.id && s.id(); } catch(e) { return null; }
+  }
+  function sourceName(s, meta) {
+    try { if (s.name) return s.name(); } catch(e) {}
+    return meta.description || meta.shortDescription || 'unknown';
+  }
+  function readReportData(s) {
+    var rd = null;
+    try { rd = s.reportData ? (typeof s.reportData === 'function' ? s.reportData() : s.reportData) : s._reportData; } catch(e) {}
+    return safeValue(rd);
+  }
+  function readOrdersData(s) {
+    var od = null;
+    try { od = s.ordersData ? (typeof s.ordersData === 'function' ? s.ordersData() : s.ordersData) : s._ordersData; } catch(e) {}
+    return safeValue(od);
+  }
+  function isStrategySource(s, meta, reportData, ordersData) {
+    return !!(
+      meta.isTVScriptStrategy ||
+      /StrategyScript/.test(meta.id || '') ||
+      reportData ||
+      ordersData ||
+      s._reportData ||
+      s._reportDataBuffer ||
+      s.ordersData ||
+      s.reportData
+    );
+  }
+  function listStrategies() {
+    var chart = ${CHART_API}._chartWidget;
+    var sources = chart.model().model().dataSources();
+    var strategies = [];
+    for (var i = 0; i < sources.length; i++) {
+      var s = sources[i];
+      var meta = {};
+      try { meta = s.metaInfo && s.metaInfo() || {}; } catch(e) {}
+      var reportData = readReportData(s);
+      var ordersData = readOrdersData(s);
+      if (!isStrategySource(s, meta, reportData, ordersData)) continue;
+      var id = sourceId(s);
+      var name = sourceName(s, meta);
+      var perf = reportData && reportData.performance || {};
+      var all = perf.all || {};
+      strategies.push({
+        index: i,
+        id: id,
+        name: name,
+        meta_id: meta.id || null,
+        is_price_study: meta.is_price_study,
+        isTVScriptStrategy: !!meta.isTVScriptStrategy,
+        report_ready: !!reportData,
+        trades_count: reportData && Array.isArray(reportData.trades) ? reportData.trades.length : null,
+        filled_orders_count: reportData && Array.isArray(reportData.filledOrders) ? reportData.filledOrders.length : null,
+        orders_count: Array.isArray(ordersData) ? ordersData.length : null,
+        net_profit: all.netProfit,
+        profit_factor: all.profitFactor,
+        source: s,
+        reportData: reportData,
+        ordersData: ordersData
+      });
+    }
+    return strategies;
+  }
+  function publicStrategy(s) {
+    return {
+      id: s.id,
+      name: s.name,
+      meta_id: s.meta_id,
+      report_ready: s.report_ready,
+      trades_count: s.trades_count,
+      filled_orders_count: s.filled_orders_count,
+      orders_count: s.orders_count,
+      net_profit: s.net_profit,
+      profit_factor: s.profit_factor
+    };
+  }
+  function activeStrategyName() {
+    var texts = [];
+    var els = document.querySelectorAll('button, [role="button"], [role="tab"], span, div');
+    for (var i = 0; i < els.length; i++) {
+      if (!visible(els[i])) continue;
+      var text = norm(els[i].textContent);
+      if (text && /OnlyBit|Strategy|List of trades|Performance Summary|Overview/.test(text)) texts.push(text);
+    }
+    return texts.join(' ');
+  }
+  function selectStrategy(selector) {
+    selector = selector || {};
+    var strategies = listStrategies();
+    if (strategies.length === 0) return { error: 'No strategy found on chart.', code: 'no_strategy', strategies: [] };
+    var selected = null;
+    if (selector.entity_id) {
+      selected = strategies.find(function(s) { return s.id === selector.entity_id; });
+      if (!selected) return { error: 'Strategy not found for entity_id: ' + selector.entity_id, code: 'strategy_not_found', strategies: strategies.map(publicStrategy) };
+    } else if (selector.strategy_name) {
+      var target = String(selector.strategy_name).toLowerCase();
+      selected = strategies.find(function(s) { return String(s.name || '').toLowerCase() === target; })
+        || strategies.find(function(s) { return String(s.name || '').toLowerCase().indexOf(target) !== -1; });
+      if (!selected) return { error: 'Strategy not found for name: ' + selector.strategy_name, code: 'strategy_not_found', strategies: strategies.map(publicStrategy) };
+    } else if (selector.active) {
+      var activeText = activeStrategyName().toLowerCase();
+      selected = strategies.slice().reverse().find(function(s) { return activeText.indexOf(String(s.name || '').toLowerCase()) !== -1; });
+      if (!selected) return { error: 'Could not determine active Strategy Tester strategy.', code: 'active_strategy_not_found', strategies: strategies.map(publicStrategy) };
+    } else if (selector.latest) {
+      selected = strategies[strategies.length - 1];
+    } else if (strategies.length === 1) {
+      selected = strategies[0];
+    } else {
+      return { error: 'Multiple strategies found. Pass entity_id, strategy_name, active, or latest.', code: 'ambiguous_strategy', strategies: strategies.map(publicStrategy) };
+    }
+    return { selected: selected, strategies: strategies };
+  }
+`;
+
+function selectorOptions({ entity_id, strategy_name, active, latest } = {}) {
+  return {
+    entity_id: entity_id || undefined,
+    strategy_name: strategy_name || undefined,
+    active: !!active,
+    latest: !!latest,
+  };
+}
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === '"' && inQuotes && next === '"') {
+      cell += '"';
+      i++;
+    } else if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === ',' && !inQuotes) {
+      row.push(cell);
+      cell = '';
+    } else if ((ch === '\n' || ch === '\r') && !inQuotes) {
+      if (ch === '\r' && next === '\n') i++;
+      row.push(cell);
+      if (row.some(v => v !== '')) rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += ch;
+    }
+  }
+  if (cell || row.length) {
+    row.push(cell);
+    if (row.some(v => v !== '')) rows.push(row);
+  }
+  return rows;
+}
+
+function listCsvFiles(dir) {
+  try {
+    return readdirSync(dir)
+      .filter(name => name.toLowerCase().endsWith('.csv'))
+      .map(name => {
+        const fullPath = join(dir, name);
+        const st = statSync(fullPath);
+        return { path: fullPath, name, mtimeMs: st.mtimeMs, size: st.size };
+      });
+  } catch {
+    return [];
+  }
+}
 
 function buildGraphicsJS(collectionName, mapKey, filter) {
   return `
@@ -132,114 +315,244 @@ export async function getIndicator({ entity_id }) {
   return { success: true, entity_id, visible: data?.visible, inputs };
 }
 
-export async function getStrategyResults() {
+export async function listStrategies() {
+  const data = await evaluate(`
+    (function() {
+      try {
+        ${STRATEGY_HELPERS}
+        return { strategies: listStrategies().map(publicStrategy), source: 'internal_api' };
+      } catch(e) {
+        return { strategies: [], source: 'internal_api', error: e.message };
+      }
+    })()
+  `);
+  return { success: true, strategy_count: data?.strategies?.length || 0, source: data?.source, strategies: data?.strategies || [], error: data?.error };
+}
+
+export async function getStrategyResults(options = {}) {
+  const selector = selectorOptions(options);
   const results = await evaluate(`
     (function() {
       try {
-        var chart = ${CHART_API}._chartWidget;
-        var sources = chart.model().model().dataSources();
-        var strat = null;
-        for (var i = 0; i < sources.length; i++) {
-          var s = sources[i];
-          if (s.metaInfo && s.metaInfo().is_price_study === false && (s.reportData || s.performance)) { strat = s; break; }
-        }
-        if (!strat) return {metrics: {}, source: 'internal_api', error: 'No strategy found on chart. Add a strategy indicator first.'};
-        var metrics = {};
-        if (strat.reportData) {
-          var rd = typeof strat.reportData === 'function' ? strat.reportData() : strat.reportData;
-          if (rd && typeof rd === 'object') {
-            if (typeof rd.value === 'function') rd = rd.value();
-            if (rd) { var keys = Object.keys(rd); for (var k = 0; k < keys.length; k++) { var val = rd[keys[k]]; if (val !== null && val !== undefined && typeof val !== 'function') metrics[keys[k]] = val; } }
-          }
-        }
-        if (Object.keys(metrics).length === 0 && strat.performance) {
-          var perf = strat.performance();
-          if (perf && typeof perf.value === 'function') perf = perf.value();
-          if (perf && typeof perf === 'object') { var pkeys = Object.keys(perf); for (var p = 0; p < pkeys.length; p++) { var pval = perf[pkeys[p]]; if (pval !== null && pval !== undefined && typeof pval !== 'function') metrics[pkeys[p]] = pval; } }
-        }
-        return {metrics: metrics, source: 'internal_api'};
+        ${STRATEGY_HELPERS}
+        var selected = selectStrategy(${JSON.stringify(selector)});
+        if (selected.error) return { metrics: {}, source: 'internal_api', error: selected.error, code: selected.code, strategies: selected.strategies };
+        var strat = selected.selected;
+        var rd = strat.reportData;
+        var perf = rd && rd.performance || {};
+        var all = perf.all || {};
+        var metrics = {
+          currency: rd && rd.currency || null,
+          date_range: rd && rd.settings && rd.settings.dateRange || null,
+          all: all,
+          long: perf.long || null,
+          short: perf.short || null,
+          maxStrategyDrawDown: perf.maxStrategyDrawDown,
+          maxStrategyDrawDownPercent: perf.maxStrategyDrawDownPercent,
+          maxStrategyRunUp: perf.maxStrategyRunUp,
+          maxStrategyRunUpPercent: perf.maxStrategyRunUpPercent,
+          openPL: perf.openPL,
+          openPLPercent: perf.openPLPercent,
+          buyHoldReturn: perf.buyHoldReturn,
+          buyHoldReturnPercent: perf.buyHoldReturnPercent,
+          sharpeRatio: perf.sharpeRatio,
+          sortinoRatio: perf.sortinoRatio,
+          maxMarginUsed: perf.maxMarginUsed,
+          avgMarginUsed: perf.avgMarginUsed,
+          openMarginUsed: perf.openMarginUsed
+        };
+        return { metrics: metrics, strategy: publicStrategy(strat), source: 'internal_api' };
       } catch(e) { return {metrics: {}, source: 'internal_api', error: e.message}; }
     })()
   `);
-  return { success: true, metric_count: Object.keys(results?.metrics || {}).length, source: results?.source, metrics: results?.metrics || {}, error: results?.error };
+  return {
+    success: !results?.error,
+    metric_count: Object.keys(results?.metrics || {}).length,
+    source: results?.source,
+    strategy: results?.strategy,
+    metrics: results?.metrics || {},
+    strategies: results?.strategies,
+    code: results?.code,
+    error: results?.error,
+  };
 }
 
-export async function getTrades({ max_trades } = {}) {
+export async function getTrades({ max_trades, entity_id, strategy_name, active, latest } = {}) {
   const limit = Math.min(max_trades || 20, MAX_TRADES);
+  const selector = selectorOptions({ entity_id, strategy_name, active, latest });
   const trades = await evaluate(`
     (function() {
       try {
-        var chart = ${CHART_API}._chartWidget;
-        var sources = chart.model().model().dataSources();
-        var strat = null;
-        for (var i = 0; i < sources.length; i++) {
-          var s = sources[i];
-          if (s.metaInfo && s.metaInfo().is_price_study === false && (s.ordersData || s.reportData)) { strat = s; break; }
+        ${STRATEGY_HELPERS}
+        var selected = selectStrategy(${JSON.stringify(selector)});
+        if (selected.error) return { trades: [], source: 'internal_api', error: selected.error, code: selected.code, strategies: selected.strategies };
+        var strat = selected.selected;
+        var reportTrades = strat.reportData && Array.isArray(strat.reportData.trades) ? strat.reportData.trades : null;
+        var filledOrders = strat.reportData && Array.isArray(strat.reportData.filledOrders) ? strat.reportData.filledOrders : null;
+        var orders = reportTrades || strat.ordersData || filledOrders || [];
+        if (!Array.isArray(orders)) return { trades: [], source: 'internal_api', error: 'Strategy trade data returned non-array.' };
+        function mapOrder(o, idx) {
+          if (reportTrades) {
+            return {
+              trade_number: idx + 1,
+              entry: o.e ? { signal: o.e.c, price: o.e.p, time: o.e.tm, side: o.e.b === true ? 'long' : (o.e.b === false ? 'short' : null), type: o.e.tp } : null,
+              exit: o.x ? { signal: o.x.c, price: o.x.p, time: o.x.tm, side: o.x.b === true ? 'long' : (o.x.b === false ? 'short' : null), type: o.x.tp } : null,
+              qty: o.q,
+              net_profit: o.rn && o.rn.v,
+              net_profit_percent: o.rn && o.rn.p,
+              cumulative_profit: o.cp && o.cp.v,
+              cumulative_profit_percent: o.cp && o.cp.p,
+              favorable_excursion: o.tp && o.tp.v,
+              favorable_excursion_percent: o.tp && o.tp.p,
+              adverse_excursion: o.dd && o.dd.v,
+              adverse_excursion_percent: o.dd && o.dd.p,
+              equity: o.v
+            };
+          }
+          var out = { trade_number: idx + 1 };
+          if (o && typeof o === 'object') {
+            var keys = Object.keys(o);
+            for (var k = 0; k < keys.length; k++) {
+              var v = o[keys[k]];
+              if (v !== null && v !== undefined && typeof v !== 'function' && typeof v !== 'object') out[keys[k]] = v;
+            }
+          }
+          return out;
         }
-        if (!strat) return {trades: [], source: 'internal_api', error: 'No strategy found on chart.'};
-        var orders = null;
-        if (strat.ordersData) { orders = typeof strat.ordersData === 'function' ? strat.ordersData() : strat.ordersData; if (orders && typeof orders.value === 'function') orders = orders.value(); }
-        if (!orders || !Array.isArray(orders)) {
-          if (strat._orders) orders = strat._orders;
-          else if (strat.tradesData) { orders = typeof strat.tradesData === 'function' ? strat.tradesData() : strat.tradesData; if (orders && typeof orders.value === 'function') orders = orders.value(); }
-        }
-        if (!orders || !Array.isArray(orders)) return {trades: [], source: 'internal_api', error: 'ordersData() returned non-array.'};
         var result = [];
         for (var t = 0; t < Math.min(orders.length, ${limit}); t++) {
-          var o = orders[t];
-          if (typeof o === 'object' && o !== null) {
-            var trade = {};
-            var okeys = Object.keys(o);
-            for (var k = 0; k < okeys.length; k++) { var v = o[okeys[k]]; if (v !== null && v !== undefined && typeof v !== 'function' && typeof v !== 'object') trade[okeys[k]] = v; }
-            result.push(trade);
-          }
+          result.push(mapOrder(orders[t], t));
         }
-        return {trades: result, source: 'internal_api'};
+        return { trades: result, total_available: orders.length, strategy: publicStrategy(strat), source: 'internal_api' };
       } catch(e) { return {trades: [], source: 'internal_api', error: e.message}; }
     })()
   `);
-  return { success: true, trade_count: trades?.trades?.length || 0, source: trades?.source, trades: trades?.trades || [], error: trades?.error };
+  return {
+    success: !trades?.error,
+    trade_count: trades?.trades?.length || 0,
+    total_available: trades?.total_available,
+    source: trades?.source,
+    strategy: trades?.strategy,
+    trades: trades?.trades || [],
+    strategies: trades?.strategies,
+    code: trades?.code,
+    error: trades?.error,
+  };
 }
 
-export async function getEquity() {
+export async function getEquity(options = {}) {
+  const selector = selectorOptions(options);
   const equity = await evaluate(`
     (function() {
       try {
-        var chart = ${CHART_API}._chartWidget;
-        var sources = chart.model().model().dataSources();
-        var strat = null;
-        for (var i = 0; i < sources.length; i++) {
-          var s = sources[i];
-          if (s.metaInfo && s.metaInfo().is_price_study === false && (s.reportData || s.performance)) { strat = s; break; }
-        }
-        if (!strat) return {data: [], source: 'internal_api', error: 'No strategy found on chart.'};
+        ${STRATEGY_HELPERS}
+        var selected = selectStrategy(${JSON.stringify(selector)});
+        if (selected.error) return { data: [], source: 'internal_api', error: selected.error, code: selected.code, strategies: selected.strategies };
+        var strat = selected.selected;
         var data = [];
-        if (strat.equityData) {
-          var eq = typeof strat.equityData === 'function' ? strat.equityData() : strat.equityData;
-          if (eq && typeof eq.value === 'function') eq = eq.value();
-          if (Array.isArray(eq)) data = eq;
-        }
-        if (data.length === 0 && strat.bars) {
-          var bars = typeof strat.bars === 'function' ? strat.bars() : strat.bars;
-          if (bars && typeof bars.lastIndex === 'function') {
-            var end = bars.lastIndex(); var start = bars.firstIndex();
-            for (var i = start; i <= end; i++) { var v = bars.valueAt(i); if (v) data.push({time: v[0], equity: v[1], drawdown: v[2] || null}); }
-          }
-        }
+        var rd = strat.reportData;
+        var perf = rd && rd.performance || {};
+        var all = perf.all || {};
+        var summary = {
+          netProfit: all.netProfit,
+          netProfitPercent: all.netProfitPercent,
+          openPL: perf.openPL,
+          openPLPercent: perf.openPLPercent,
+          maxStrategyDrawDown: perf.maxStrategyDrawDown,
+          maxStrategyDrawDownPercent: perf.maxStrategyDrawDownPercent,
+          maxStrategyRunUp: perf.maxStrategyRunUp,
+          maxStrategyRunUpPercent: perf.maxStrategyRunUpPercent,
+          buyHoldReturn: perf.buyHoldReturn,
+          buyHoldReturnPercent: perf.buyHoldReturnPercent
+        };
+        var series = {
+          buyHold: rd && Array.isArray(rd.buyHold) ? rd.buyHold : undefined,
+          buyHoldPercent: rd && Array.isArray(rd.buyHoldPercent) ? rd.buyHoldPercent : undefined,
+          marginUsage: rd && Array.isArray(rd.marginUsage) ? rd.marginUsage : undefined
+        };
         if (data.length === 0) {
-          var perfData = {};
-          if (strat.performance) {
-            var perf = strat.performance();
-            if (perf && typeof perf.value === 'function') perf = perf.value();
-            if (perf && typeof perf === 'object') { var pkeys = Object.keys(perf); for (var p = 0; p < pkeys.length; p++) { if (/equity|drawdown|profit|net/i.test(pkeys[p])) perfData[pkeys[p]] = perf[pkeys[p]]; } }
-          }
-          if (Object.keys(perfData).length > 0) return {data: [], equity_summary: perfData, source: 'internal_api', note: 'Full equity curve not available via API; equity summary metrics returned instead.'};
+          return { data: [], equity_summary: summary, available_series: series, strategy: publicStrategy(strat), source: 'internal_api', note: 'Full equity curve is not exposed by this TradingView API surface; summary and available report series returned.' };
         }
-        return {data: data, source: 'internal_api'};
+        return { data: data, equity_summary: summary, available_series: series, strategy: publicStrategy(strat), source: 'internal_api' };
       } catch(e) { return {data: [], source: 'internal_api', error: e.message}; }
     })()
   `);
-  return { success: true, data_points: equity?.data?.length || 0, source: equity?.source, data: equity?.data || [], equity_summary: equity?.equity_summary, note: equity?.note, error: equity?.error };
+  return {
+    success: !equity?.error,
+    data_points: equity?.data?.length || 0,
+    source: equity?.source,
+    strategy: equity?.strategy,
+    data: equity?.data || [],
+    equity_summary: equity?.equity_summary,
+    available_series: equity?.available_series,
+    strategies: equity?.strategies,
+    note: equity?.note,
+    code: equity?.code,
+    error: equity?.error,
+  };
+}
+
+export async function exportTrades({ entity_id, strategy_name, active, latest, downloads_dir, timeout_ms } = {}) {
+  const selector = selectorOptions({ entity_id, strategy_name, active, latest });
+  const selected = await evaluate(`
+    (function() {
+      try {
+        ${STRATEGY_HELPERS}
+        var selected = selectStrategy(${JSON.stringify(selector)});
+        if (selected.error) return { error: selected.error, code: selected.code, strategies: selected.strategies };
+        return { strategy: publicStrategy(selected.selected) };
+      } catch(e) {
+        return { error: e.message };
+      }
+    })()
+  `);
+  if (selected?.error) {
+    return { success: false, error: selected.error, code: selected.code, strategies: selected.strategies };
+  }
+
+  const dir = downloads_dir || join(homedir(), 'Downloads');
+  const before = new Map(listCsvFiles(dir).map(f => [f.path, f.mtimeMs]));
+  const clicked = await evaluate(`
+    (function() {
+      function visible(el) { return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length)); }
+      var buttons = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]'));
+      var btn = buttons.find(function(b) { return visible(b) && /Download \\.csv/i.test(String(b.getAttribute('title') || '')); });
+      if (!btn) return { clicked: false, error: 'Download .csv button not found. Open Strategy Tester List of trades first.' };
+      btn.click();
+      return { clicked: true, title: btn.getAttribute('title') || null };
+    })()
+  `);
+  if (!clicked?.clicked) return { success: false, strategy: selected.strategy, error: clicked?.error || 'Download .csv button not found.' };
+
+  const timeout = timeout_ms || 15000;
+  const start = Date.now();
+  let file = null;
+  while (Date.now() - start < timeout) {
+    const candidates = listCsvFiles(dir)
+      .filter(f => !before.has(f.path) || f.mtimeMs > before.get(f.path))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (candidates.length > 0 && candidates[0].size > 0) {
+      file = candidates[0];
+      break;
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  if (!file) return { success: false, strategy: selected.strategy, clicked, error: 'CSV download was not detected before timeout.', downloads_dir: dir };
+
+  const text = readFileSync(file.path, 'utf8');
+  const rows = parseCsvRows(text);
+  const columns = rows[0] || [];
+  return {
+    success: true,
+    strategy: selected.strategy,
+    clicked,
+    file_path: file.path,
+    file_name: basename(file.path),
+    downloads_dir: dir,
+    size_bytes: file.size,
+    row_count: Math.max(rows.length - 1, 0),
+    columns,
+  };
 }
 
 export async function getQuote({ symbol } = {}) {
